@@ -7,7 +7,7 @@ argument-hint: "<operation_name> <dtype> [buffer_sizes...] or <pytorch_op_descri
 # NPU Kernel & Test Generator
 
 Generate NPU kernel `.cc` files and `test.py` for AIE operations. Supports two modes:
-- **Small kernel** (data fits in single tile, <=1024 elements per buffer): generates `kernel_func.cc`, `canonical_scalar.cc`, `canonical_scalar_allo.cc`, `test.py`
+- **Small kernel** (data fits in single tile, <=1024 elements per buffer): generates `kernel_func.cc` (vectorized) + `test.py`
 - **Large kernel** (data exceeds single tile): generates `{name}.cc` (tiled kernel) + `{name}_test.py` (with tiling/mapping logic)
 
 ## Step 0: Determine Kernel Size Class
@@ -53,15 +53,13 @@ Create directory: `llm_codegen_spec/npueval_dataset/{operation_name}_{dtype}/`
 
 ```
 {operation_name}_{dtype}/
-├── kernel_func.cc              # AIE kernel stub (TODO placeholder)
-├── canonical_scalar.cc         # Pure C++ scalar reference implementation
-├── canonical_scalar_allo.cc    # AIE-wrapped scalar implementation
+├── kernel_func.cc              # Primary AIE kernel (vectorized-first)
 └── test.py                     # Allo dataflow test harness
 ```
 
 ### File Templates
 
-#### 1. kernel_func.cc — AIE Kernel Stub
+#### 1. kernel_func.cc — Primary Vectorized AIE Kernel
 
 ```cpp
 // Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
@@ -80,54 +78,17 @@ extern "C" {
 
 void KERNEL_NAME(PARAMS_WITH_FIXED_ARRAYS) {
     event0();
-    // TODO: Implement the kernel
+    // Implement vectorized compute path first:
+    // - aie::load_v / vector math / aie::store_v
+    // - AIE_PREPARE_FOR_PIPELINING + AIE_LOOP_MIN_ITERATION_COUNT(...)
+    // - tail handling for non-multiple vector lengths
     event1();
 }
 
 } // extern "C"
 ```
 
-#### 2. canonical_scalar.cc — Pure C++ Reference
-
-```cpp
-// Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: MIT
-
-void KERNEL_NAME(PARAMS_WITH_POINTERS) {
-    // Pure scalar C++ implementation
-    // NO AIE includes, NO event0/event1
-    // Use raw pointers (e.g., int8_t*, bfloat16*)
-}
-```
-
-#### 3. canonical_scalar_allo.cc — AIE-Wrapped Scalar
-
-```cpp
-// Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
-// SPDX-License-Identifier: MIT
-
-#define NOCPP
-
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <type_traits>
-
-#include <aie_api/aie.hpp>
-
-extern "C" {
-
-void KERNEL_NAME(PARAMS_WITH_FIXED_ARRAYS) {
-    event0();
-    // Same scalar logic as canonical_scalar.cc
-    // but with std:: prefixed types (std::int8_t, std::int32_t, std::uint32_t)
-    event1();
-}
-
-} // extern "C"
-```
-
-#### 4. test.py — Allo Test Harness (Small)
+#### 2. test.py — Allo Test Harness (Small)
 
 ```python
 import os
@@ -201,7 +162,7 @@ def _test_KERNEL_NAME(kernel_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kernel_path", type=str, default="canonical_scalar_allo.cc")
+    parser.add_argument("--kernel_path", type=str, default="kernel_func.cc")
     args = parser.parse_args()
     if Path(TOP_PRJ_ABS_DIR).exists():
         shutil.rmtree(TOP_PRJ_ABS_DIR)
@@ -308,7 +269,7 @@ void KERNEL_NAME(float input[INPUT_SIZE], float output[OUTPUT_SIZE], float param
     const float *weights = param;
     const float *bias = param + WEIGHT_SIZE;
 
-    // Core computation on ONE tile — pure scalar loops
+    // Core computation on ONE tile — vectorized-first loops
     for (...) {
         for (...) {
             // accumulate with double for float32 precision
@@ -521,7 +482,7 @@ def _test_KERNEL_NAME(kernel_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kernel_path", type=str, default="canonical_scalar_allo.cc")
+    parser.add_argument("--kernel_path", type=str, default="KERNEL_NAME.cc")
     args = parser.parse_args()
     if Path(TOP_PRJ_ABS_DIR).exists():
         shutil.rmtree(TOP_PRJ_ABS_DIR)
@@ -590,17 +551,16 @@ For float32 kernels (especially multi-accumulation like conv/matmul):
 
 ### C++ Types (in .cc files)
 
-| dtype      | kernel_func.cc / canonical_scalar_allo.cc | canonical_scalar.cc |
-|------------|-------------------------------------------|---------------------|
-| int8       | `std::int8_t`                             | `int8_t`            |
-| int16      | `std::int16_t`                            | `int16_t`           |
-| int32      | `std::int32_t`                            | `int32_t`           |
-| bfloat16   | `bfloat16`                                | `bfloat16`          |
-| float32    | `float`                                   | `float`             |
+| dtype      | kernel_func.cc |
+|------------|----------------|
+| int8       | `std::int8_t`  |
+| int16      | `std::int16_t` |
+| int32      | `std::int32_t` |
+| bfloat16   | `bfloat16`     |
+| float32    | `float`        |
 
-- `kernel_func.cc` and `canonical_scalar_allo.cc`: parameters use **fixed-size arrays** (e.g., `std::int8_t in[1024]`)
-- `canonical_scalar.cc`: parameters use **raw pointers** (e.g., `int8_t* in`)
-- Loop variables in AIE-wrapped files use `std::uint32_t` / `std::int32_t`
+- `kernel_func.cc`: prefer fixed-size array parameters for small kernels (e.g., `std::int8_t in[1024]`)
+- Loop variables in AIE kernels use `std::uint32_t` / `std::int32_t` as needed
 
 ### Python Types (in test.py)
 
@@ -662,6 +622,30 @@ When dtype is `bfloat16`:
 
 ---
 
+## Vectorization-First Policy (Default)
+
+For AIE/NPU kernels, **default to vectorized implementation**.
+Do not generate `canonical_scalar.cc` or `canonical_scalar_allo.cc` in normal workflow.
+If an operation cannot be vectorized with available AIE API, explicitly report that limitation and still keep `kernel_func.cc` as the only kernel artifact.
+
+When vectorizing, follow these hard rules:
+1. Use `#include <aie_api/aie.hpp>` and AIE vector types (`aie::vector`, `aie::accum`) where applicable.
+2. Compute vector factor from dtype and kernel family conventions (e.g., `256 / (sizeof(T) * 8)` or existing reference's fixed factor).
+3. Use `__restrict` pointers on hot input/output buffers.
+4. Use `aie::load_v<...>` / vector arithmetic / `aie::store_v(...)` in the innermost loop.
+5. Add loop scheduling pragmas for hot loops:
+    - `AIE_PREPARE_FOR_PIPELINING`
+    - `AIE_LOOP_MIN_ITERATION_COUNT(16)` (or a justified lower bound)
+6. Keep tail handling for non-multiple vector lengths (masked/tail loop).
+7. Keep `event0()` / `event1()` around the compute region for trace analysis.
+
+Vectorization guidance should be aligned with:
+- `https://github.com/Xilinx/mlir-aie/tree/main/programming_guide`
+- `programming_guide/section-4/section-4c/README.md`
+- `programming_guide/quick_reference.md`
+
+---
+
 ## Workflow (MUST follow this order)
 
 ### Step 1: Parse & Classify
@@ -673,56 +657,66 @@ When dtype is `bfloat16`:
 
 **You MUST read real reference files from the codebase before writing any .cc or test.py.** Do NOT rely solely on templates in this skill — always ground your output in actual working code from the repository.
 
+Use this source priority (skill-local mirrors only):
+1. `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/*` and `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/*` (primary)
+2. `${CLAUDE_SKILL_DIR}/references/allo_examples/*` (secondary)
+3. `${CLAUDE_SKILL_DIR}/references/verified_large_kernel/*` (task-specific)
+
 Choose the most similar existing kernel based on operation type:
 
-#### For Small Kernels — read from `llm_codegen_spec/npueval_dataset/`
+#### For Small Kernels — read from `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/` and `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/`
 
-Select the closest match by operation category, then READ all files from the **bundled references** inside this skill:
+Select the closest match by operation category, then READ all files from these bundled references:
 
-| Your operation type | Reference to read (under `${CLAUDE_SKILL_DIR}/references/npueval_samples/`) | Why |
-|--------------------|-----------------------|-----|
-| Element-wise unary (relu, abs, sign, ceil, sqrt, negate) | `relu_int8/` | Simple 1-in-1-out pattern |
-| Element-wise unary float (sigmoid, tanh, gelu) | `sigmoid_bfloat16/` | Math-heavy, bfloat16 handling |
-| Element-wise binary (add, subtract, min, max) | `vectoradd_bfloat16/` | 2-in-1-out pattern |
-| Pooling (avgpool, maxpool) | `avgpool2d_bfloat16/` | 2D spatial, output != input size |
-| MatMul / dot product | `matmul_16x16_int8/` | Multi-loop accumulation |
-| Conv1d | `conv1d_bfloat16/` | Sliding window with params |
+| Your operation type | Reference to read | Why |
+|--------------------|-------------------|-----|
+| Element-wise unary / binary | `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/gelu.cc` | Vectorized math kernel style |
+| Normalization family | `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/norm.cc` + `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/test_norm.py` | ExternalModule + vectorized kernel pairing |
+| MatMul / GEMM | `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/gemm.py` + `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/test_mapping_gemm.py` | Mapping and end-to-end build pattern |
+| General AIE kernel style | `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/layer_norm.cc`, `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/softmax_bf16.cc` | Vectorized loops, accumulators, numerics |
 
-**Concrete read steps** (example for element-wise unary bfloat16):
+If the bundled samples don't cover your exact case:
+1. Search `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/` and `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/` for the nearest operation family.
+2. Then adapt from `${CLAUDE_SKILL_DIR}/references/verified_large_kernel/` patterns for buffer packing and tiling.
+
+#### For Large Kernels — read from skill-local GEMM/norm mirrors first, then large-kernel mirrors
+
+**Always read these files first:**
 ```
-Read: ${CLAUDE_SKILL_DIR}/references/npueval_samples/sigmoid_bfloat16/kernel_func.cc
-Read: ${CLAUDE_SKILL_DIR}/references/npueval_samples/sigmoid_bfloat16/canonical_scalar.cc
-Read: ${CLAUDE_SKILL_DIR}/references/npueval_samples/sigmoid_bfloat16/canonical_scalar_allo.cc
-Read: ${CLAUDE_SKILL_DIR}/references/npueval_samples/sigmoid_bfloat16/test.py
-```
-
-If the bundled samples don't cover your exact case, also search `llm_codegen_spec/npueval_dataset/` for a closer match.
-
-#### For Large Kernels — read from bundled `${CLAUDE_SKILL_DIR}/references/large_kernel/`
-
-**Always read these files:**
-```
-Read: ${CLAUDE_SKILL_DIR}/references/large_kernel/conv2d_3x64_b1a_fp32.cc
-Read: ${CLAUDE_SKILL_DIR}/references/large_kernel/conv2d_3x64_b1a_fp32_test.py
-Read: ${CLAUDE_SKILL_DIR}/references/large_kernel/conv2d_3x64_b1a_fp32.py
+Read: ${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/gemm.py
+Read: ${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/norm.cc
+Read: ${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/test_mapping_gemm.py
 ```
 
-**Also read mapping/layout references from bundled `${CLAUDE_SKILL_DIR}/references/allo_tests/`** (pick the most relevant):
+**Then read these bundled mirrors when needed:**
+```
+Read: ${CLAUDE_SKILL_DIR}/references/verified_large_kernel/conv2d_3x64_b1a_fp32.cc
+Read: ${CLAUDE_SKILL_DIR}/references/verified_large_kernel/conv2d_3x64_b1a_fp32_test.py
+Read: ${CLAUDE_SKILL_DIR}/references/verified_large_kernel/conv2d_3x64_b1a_fp32.py
+```
+
+**Also read mapping/layout references from bundled `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_tests/`** (pick the most relevant):
 
 | Your operation type | Additional reference to read |
 |--------------------|------------------------------|
-| Conv / spatial ops | `allo_tests/test_norm.py` + `allo_tests/norm.cc` |
-| MatMul / GEMM | `allo_tests/test_mapping_gemm.py` |
-| General mapping patterns | `allo_tests/test_mapping_basic.py` |
-| Multi-core parallel | `allo_tests/test_collective_communication.py` |
-| Meta-programming (meta_if/meta_for) | `allo_tests/test_meta_for.py` |
+| Conv / spatial ops | `allo_examples/allo_tests/test_norm.py` + `allo_examples/allo_kernels/norm.cc` |
+| MatMul / GEMM | `allo_examples/allo_tests/test_mapping_gemm.py` |
+| General mapping patterns | `allo_examples/allo_tests/test_mapping_basic.py` |
+| Multi-core parallel | `allo_examples/allo_tests/test_collective_communication.py` |
+| Meta-programming (meta_if/meta_for) | `allo_examples/allo_tests/test_meta_for.py` |
+
+#### For ANY kernel — additionally read vector programming guidance:
+- `https://github.com/Xilinx/mlir-aie/tree/main/programming_guide`
+- `programming_guide/section-4/section-4c/README.md`
+- `programming_guide/quick_reference.md`
 
 #### For ANY kernel — optionally read from bundled references:
 - `${CLAUDE_SKILL_DIR}/references/api_doc/api_doc.md` — AIE vector/accumulator API details
-- `${CLAUDE_SKILL_DIR}/references/allo_kernels/memory.py` — Layout/Shard/Replicate API
-- `${CLAUDE_SKILL_DIR}/references/allo_kernels/gelu.cc` — LUT-based activation kernel example
-- `${CLAUDE_SKILL_DIR}/references/allo_kernels/layer_norm.cc` — normalization kernel example
-- `${CLAUDE_SKILL_DIR}/references/allo_kernels/softmax_bf16.cc` — softmax bfloat16 example
+- `${CLAUDE_SKILL_DIR}/references/allo_docs/dataflow.rst` — Allo dataflow concept and patterns
+- `${CLAUDE_SKILL_DIR}/references/allo_docs/memory.py` — Layout/Shard/Replicate API
+- `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/gelu.cc` — LUT-based activation kernel example
+- `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/layer_norm.cc` — normalization kernel example
+- `${CLAUDE_SKILL_DIR}/references/allo_examples/allo_kernels/softmax_bf16.cc` — softmax bfloat16 example
 
 ### Step 3: Plan Tile Geometry (large kernels only)
 
@@ -736,6 +730,8 @@ Generate files by **adapting the reference code you just read**, NOT by filling 
 
 1. **Start from the reference test.py** you read in Step 2
 2. **Modify** the reference to match the new operation's semantics:
+    - Keep vectorized path as the default implementation (use `aie::load_v`/`aie::store_v` and loop pragmas)
+    - Do not emit scalar-only kernel bodies unless vectorization is explicitly impossible
    - Change kernel name, function signature, buffer sizes
    - Rewrite the reference function for the new operation
    - Adjust input generation (dtype, range, shape)
@@ -768,54 +764,56 @@ Before finalizing, verify these match between .cc and test.py:
 - List generated files
 - For large kernels: tile geometry, memory budget, estimated tile/group count
 - Suggest test command:
-  - Small kernel: `python test.py --kernel_path canonical_scalar_allo.cc`
+    - Small kernel: `python test.py --kernel_path kernel_func.cc`
   - Large kernel: `python main.py --kernel {name}`
 
 ## Bundled Reference Files Index
 
-All references are bundled under `${CLAUDE_SKILL_DIR}/references/`. Read from here instead of searching the repo.
+All references are bundled under `${CLAUDE_SKILL_DIR}/references/` as local mirrors. Use these paths directly.
 
-### `references/npueval_samples/` — Small kernel references
-| Directory | Pattern |
-|-----------|---------|
-| `relu_int8/` | Simplest unary int8 (4 files: kernel_func.cc, canonical_scalar.cc, canonical_scalar_allo.cc, test.py) |
-| `sigmoid_bfloat16/` | Unary bfloat16 with math |
-| `vectoradd_bfloat16/` | Binary operation bfloat16 |
-| `matmul_16x16_int8/` | MatMul with accumulator |
-| `avgpool2d_bfloat16/` | Different input/output sizes |
-| `conv1d_bfloat16/` | Conv with params buffer |
-| `utils.py` | Shared utilities (TOP_PRJ_ABS_DIR, analyze_trace) |
-
-### `references/large_kernel/` — Large kernel references
+### `references/verified_large_kernel/` — Large kernel references
 | File | Purpose |
 |------|---------|
 | `conv2d_3x64_b1a_fp32.cc` | Complete tiled conv2d kernel |
 | `conv2d_3x64_b1a_fp32_test.py` | Full tiling + 4-core mapping + verification |
 | `conv2d_3x64_b1a_fp32.py` | PyTorch reference model |
-| `abs_int8.cc` | Simple vectorized AIE kernel |
-| `abs_int8_test.py` | Simple kernel test with mapping=[1] |
 
-### `references/allo_tests/` — Allo dataflow/mapping patterns
+### `references/allo_examples/allo_tests/` — Allo dataflow/mapping patterns
 | File | Purpose |
 |------|---------|
-| `test_norm.py` + `norm.cc` | Normalization tiling pattern |
+| `test_norm.py` | Normalization test + ExternalModule pattern |
 | `test_mapping_basic.py` | Basic mapping examples |
 | `test_mapping_gemm.py` | GEMM mapping pattern |
 | `test_meta_for.py` | Meta-programming (meta_if/meta_for) |
 | `test_collective_communication.py` | Multi-core communication |
+| `gemm.py` | GEMM end-to-end validation script |
 
-### `references/allo_kernels/` — AIE kernel implementations
+### `references/allo_examples/` — Mirrored Allo reference bundle
 | File | Purpose |
 |------|---------|
+| `allo_tests/*` | Test and mapping patterns |
+| `allo_kernels/*` | AIE kernel implementations |
+
+### `references/allo_examples/allo_kernels/` — AIE kernel implementations
+| File | Purpose |
+|------|---------|
+| `norm.cc` | Vectorized normalization kernel |
+| `mm.cc` | GEMM kernel implementation |
+| `mixed_mm.cc` | Mixed-precision GEMM kernel implementation |
 | `gelu.cc` | LUT-based activation kernel |
 | `layer_norm.cc` | Normalization with vector ops |
 | `softmax_bf16.cc` | Softmax bfloat16 |
-| `memory.py` | Layout/Shard/Replicate API source |
 
 ### `references/api_doc/`
 | File | Purpose |
 |------|---------|
 | `api_doc.md` | AMD AIE API — vector types, accumulators, memory ops, arithmetic |
 
+### `references/allo_docs/`
+| File | Purpose |
+|------|---------|
+| `dataflow.rst` | Allo dataflow design notes and examples |
+| `memory.py` | Allo memory layout API source |
+
 ### In-skill documentation
-- [examples.md](examples.md) — 5 annotated examples with explanations (small + large kernels)
+- [examples.md](examples.md) — reference-first vectorized cookbook

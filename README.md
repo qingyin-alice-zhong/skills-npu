@@ -8,7 +8,7 @@ Given an operation name, data type, and tensor shapes, this skill generates comp
 
 **Two modes:**
 
-- **Small kernel** (single tile, ≤1024 elements/buffer): generates `kernel_func.cc`, `canonical_scalar.cc`, `canonical_scalar_allo.cc`, and `test.py`
+- **Small kernel** (single tile, ≤1024 elements/buffer): generates vectorized `kernel_func.cc` and `test.py`
 - **Large kernel** (multi-tile, e.g. from PyTorch `nn.Module`): generates a tiled `.cc` kernel + `_test.py` with multi-core mapping, tile decomposition, and full-shape verification
 
 ## Usage
@@ -25,19 +25,14 @@ Or describe the operation in natural language — the skill triggers automatical
 
 ```
 ├── SKILL.md                    # Main skill instructions
-├── examples.md                 # 5 annotated examples (small + large kernels)
+├── examples.md                 # Reference-first cookbook (allo + mlir-aie)
 └── references/
     ├── api_doc/                # AMD AIE API documentation
-    ├── allo_kernels/           # Kernel implementations (gelu, layer_norm, softmax)
-    ├── allo_tests/             # Dataflow mapping/tiling patterns
-    ├── npueval_samples/        # 6 complete small kernel examples
-    │   ├── relu_int8/
-    │   ├── sigmoid_bfloat16/
-    │   ├── vectoradd_bfloat16/
-    │   ├── matmul_16x16_int8/
-    │   ├── avgpool2d_bfloat16/
-    │   └── conv1d_bfloat16/
-    └── large_kernel/           # Large kernel tiling + 4-core mapping example
+    ├── allo_docs/              # Mirrored Allo docs/utilities (dataflow.rst, memory.py)
+    ├── allo_examples/          # Mirrored Allo reference bundle
+    │   ├── allo_kernels/       # Kernel implementations (norm, mm, mixed_mm, ...)
+    │   └── allo_tests/         # Dataflow mapping/tiling/test patterns (incl. gemm.py)
+    └── verified_large_kernel/  # Large kernel tiling + 4-core mapping example
 ```
 
 ## Key features
@@ -47,3 +42,5 @@ Or describe the operation in natural language — the skill triggers automatical
 - Type mapping for int8/int16/int32/bfloat16/float32 across C++, allo, and numpy
 - Multi-core parallel dispatch with `pid`-based routing
 - Reference-grounded generation — reads real working code before generating
+- Reference paths are local-only — all examples are copied under `references/`
+- Vectorization-first policy — prefers `aie::load_v/store_v` + pipeline pragmas
