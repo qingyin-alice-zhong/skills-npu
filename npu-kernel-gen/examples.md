@@ -48,28 +48,6 @@ When generating new kernels/tests, read references in this order:
 - Keeps per-core buffers explicit (`A0..A3`, `C0..C3`, `P0..P3`)
 - Handles boundary/partial tiles with zero-padding and `actual_extent`
 
-### Dispatch skeleton
-
-```python
-@df.region()
-def top(A0: Ty[IN], A1: Ty[IN], A2: Ty[IN], A3: Ty[IN],
-        C0: Ty[OUT], C1: Ty[OUT], C2: Ty[OUT], C3: Ty[OUT],
-        P0: Ty[PAR], P1: Ty[PAR], P2: Ty[PAR], P3: Ty[PAR]):
-    @df.kernel(mapping=[4], args=[A0, A1, A2, A3, C0, C1, C2, C3, P0, P1, P2, P3])
-    def core(lA0: Ty[IN] @ LyRep, lA1: Ty[IN] @ LyRep, lA2: Ty[IN] @ LyRep, lA3: Ty[IN] @ LyRep,
-             lC0: Ty[OUT] @ LyRep, lC1: Ty[OUT] @ LyRep, lC2: Ty[OUT] @ LyRep, lC3: Ty[OUT] @ LyRep,
-             lP0: Ty[PAR] @ LyRep, lP1: Ty[PAR] @ LyRep, lP2: Ty[PAR] @ LyRep, lP3: Ty[PAR] @ LyRep):
-        pid, = df.get_pid()
-        with allo.meta_if(pid == 0):
-            kernel(lA0, lC0, lP0)
-        with allo.meta_elif(pid == 1):
-            kernel(lA1, lC1, lP1)
-        with allo.meta_elif(pid == 2):
-            kernel(lA2, lC2, lP2)
-        with allo.meta_else():
-            kernel(lA3, lC3, lP3)
-```
-
 ---
 
 ## 3) What to Avoid
