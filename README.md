@@ -31,8 +31,8 @@ Or describe the operation in natural language — the skill triggers automatical
     ├── allo_docs/              # Mirrored Allo docs/utilities (dataflow.rst, memory.py)
     ├── allo_examples/          # Mirrored Allo reference bundle
     │   ├── allo_kernels/       # Kernel implementations (norm, mm, mixed_mm, ...)
-    │   └── allo_tests/         # Dataflow mapping/tiling/test patterns (incl. gemm.py)
-    └── verified_large_kernel/  # Large kernel tiling + 4-core mapping example
+    └── └── allo_tests/         # Dataflow mapping/tiling/test patterns (incl. gemm.py)
+     
 ```
 
 ## Key features
